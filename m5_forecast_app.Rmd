@@ -1,0 +1,212 @@
+---
+title: "沃尔玛销量数据预测"
+output: 
+    flexdashboard::flex_dashboard:
+        orientation: rows
+        theme:
+            bg: "#FFFFFF"
+            fg: "#2c3e50"
+            primary: "#18bc9c"
+            base_font: !expr bslib::font_google("Oswald")
+runtime: shiny
+---
+    
+    ```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo    = FALSE,
+    message = FALSE, 
+    warning = FALSE
+)
+
+library(shiny)
+library(collapsibleTree)
+library(plotly)
+library(DT)
+    
+library(modeltime)
+library(modeltime.ensemble)
+library(tidymodels)
+    
+library(tidyverse)
+library(timetk)
+
+```
+
+
+```{r}
+hierarchy_tbl <- read_rds("m5-forecasting-accuracy/sales_sample_tbl.rds") %>%
+    select(contains("id"))
+
+full_data_tbl    <- read_rds("m5-forecasting-accuracy/full_data_tbl.rds")
+
+test_forecast_ensemble_tbl <- read_rds("m5-forecasting-accuracy/test_forecast_ensemble_tbl.rds")
+
+future_forecast_ensemble_tbl <- read_rds("m5-forecasting-accuracy/future_forecast_ensemble_tbl.rds")
+
+purchases_summarized_tbl <- full_data_tbl %>%
+    select(category, identifier, value) %>%
+    group_by(category, identifier) %>%
+    summarise(value = sum(value, na.rm = T)) %>%
+    ungroup() %>%
+    filter(category == 'item_id') %>%
+    left_join(hierarchy_tbl, by = c("identifier" = "item_id")) %>%
+    select(-id) 
+
+indicator_options <- full_data_tbl %>%
+    distinct(category, identifier) %>%
+    mutate(category = factor(
+        category, 
+        levels = c("all_stores_id", "state_id", "store_id", 
+                   "cat_id", "dept_id", "item_id"))
+    ) %>%
+    arrange(category, identifier) %>%
+    pull(identifier)
+```
+
+
+
+## Column {.sidebar}
+
+#### 描述
+
+本项目进行了分层次的预测，从州、商店、部门、商品种类到具体某一件商品的销量预测。
+
+<hr>
+    
+    
+```{r}
+shiny::selectInput(
+    "indicator", 
+    label     = "选择一个层次进行预测",
+    choices   = indicator_options, 
+    selectize = TRUE
+)
+
+shiny::radioButtons(
+    inputId  = "lookback",
+    label    = "选择过去一段时间",
+    choices  = c("3 months", "6 months", "12 months", "2 years"),
+    selected = "2 years",
+    inline   = FALSE
+)
+```
+
+<hr>
+
+#### 背景
+
+该数据为 M5 比赛数据集，目的是对分布在不同州的沃尔玛商店进行产品的销量的预测。数据集时间跨度为2011-01-29至2016-05-22，需要对未来28天的销量进行预测。
+
+
+## Column 1
+
+### 各层级总销量（2011-2016）
+
+
+```{r}
+renderCollapsibleTree({
+    purchases_summarized_tbl %>%
+        # filter(identifier %in% input$indicator) %>%
+        collapsibleTree(
+            hierarchy = c("state_id", "store_id", "cat_id", "dept_id", "identifier"),
+            attribute = "value",
+            root      = "All Stores",
+            aggFun    = sum, 
+            nodeSize  = "value",
+            tooltip   = TRUE, 
+            fontSize  = 16
+        )
+})
+```
+
+## Row {.tabset .tabset-fade}
+
+### 预测结果（未来 28 天）
+
+```{r}
+renderPlotly({
+    future_forecast_ensemble_tbl %>%
+    
+        # FILTERS 
+        filter(identifier %in% input$indicator) %>%
+        
+        group_by(identifier) %>%
+        
+        # Focus on end of series
+        filter_by_time(
+            .start_date = last(date) %-time% input$lookback, 
+            .end_date = "end"
+        ) %>%
+        
+        plot_modeltime_forecast(
+            .facet_ncol         = 2, 
+            .conf_interval_show = TRUE,
+            .interactive        = TRUE
+        )
+})
+```
+
+
+### 测试集预测
+
+```{r}
+renderPlotly({
+    test_forecast_ensemble_tbl %>%
+    
+        # FILTERS 
+        filter(identifier %in% input$indicator) %>%
+        
+        group_by(identifier) %>%
+        
+        # Focus on end of series
+        filter_by_time(
+            .start_date = last(date) %-time% input$lookback, 
+            .end_date = "end"
+        ) %>%
+        
+        plot_modeltime_forecast(
+            .facet_ncol         = 2, 
+            .conf_interval_show = TRUE,
+            .interactive        = TRUE
+        )
+})
+
+```
+
+### 测试集结果评估
+
+```{r}
+accuracy_by_identifier_tbl <- test_forecast_ensemble_tbl %>%
+    select(category, identifier, .model_desc, .index, .value) %>%
+    pivot_wider(
+        names_from   = .model_desc,
+        values_from  = .value
+    ) %>%
+    drop_na() %>%
+    rename(PREDICTION = 5) %>%
+    group_by(category, identifier) %>%
+    summarize_accuracy_metrics(
+        truth      = ACTUAL, 
+        estimate   = PREDICTION, 
+        metric_set = default_forecast_accuracy_metric_set()
+    )
+
+renderDataTable({
+    df <- accuracy_by_identifier_tbl %>%
+        # FILTERS 
+        filter(identifier %in% input$indicator) %>%
+        mutate(across(c(mae, mape, rmse, smape), ~ round(., 1))) %>%
+        mutate(across(c(mase, rsq), ~ round(., 3))) 
+    
+    datatable(
+        data = df, 
+        options = list(
+          scrollX = TRUE, 
+          scrollY = TRUE,
+          dom     = 'Bfrtip',
+          buttons = c('copy', 'csv', 'excel')
+        )
+    )
+})
+```
+
